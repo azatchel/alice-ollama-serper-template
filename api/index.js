@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, configuration, authorized,
-  keysFor, searchWeb, askOllama, errorForUser, TOTAL_RESPONSE_BUDGET_MS } from '../lib/core.js';
+  keysFor, searchWeb, searchExcerpt, askOllama, errorForUser, TOTAL_RESPONSE_BUDGET_MS, SERPER_TIMEOUT_MS } from '../lib/core.js';
 import { createStore } from '../lib/store.js';
 
 const ID = value => typeof value === 'string' && value.length > 0 && value.length <= 256;
@@ -40,7 +40,7 @@ export function createHandler({ env = process.env, fetcher = fetch, storeFactory
     const keys = keysFor(config, session);
     const controller = new AbortController();
     const store = storeFactory(config, fetcher, { signal: controller.signal });
-    const timeoutReply = 'Не успела подготовить ответ. Попробуй задать вопрос чуть короче через 15 секунд.';
+    const timeoutReply = 'Не успела подготовить ответ. Попробуй задать вопрос чуть короче.';
     let deadlineTimer;
     const deadline = new Promise(resolve => {
       deadlineTimer = setTimeout(() => {
@@ -56,7 +56,6 @@ export function createHandler({ env = process.env, fetcher = fetch, storeFactory
           id: randomUUID(), messageId: session.message_id, status: 'pending', startedAt: now()
         });
         if (reservation.code === -1) return reservation.job?.answer || 'Этот вопрос уже обрабатывается. Попробуй позже.';
-        if (reservation.code > 0) return `Новый вопрос можно задать через ${Math.ceil(reservation.code / 1000)} секунд.`;
         job = reservation.job;
       } catch {
         // Fail closed if the bounded local store cannot accept a record.
@@ -65,16 +64,24 @@ export function createHandler({ env = process.env, fetcher = fetch, storeFactory
       if (controller.signal.aborted) return timeoutReply;
       const history = safeHistory(job.history);
       let completed;
+      let search = { status: 'not_requested' };
       try {
-        const search = isSearchIntent(text)
-          ? await searchWeb(fetcher, config, text, { signal: controller.signal, timeoutMs: Math.min(600, Math.max(0, remainingMs() - 1000)) })
+        const searchStartedAt = now();
+        search = isSearchIntent(text)
+          ? await searchWeb(fetcher, config, text, { signal: controller.signal, timeoutMs: Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 1000)) })
           : { status: 'not_requested' };
+        if (search.status !== 'not_requested') logger.info?.('Web search completed', {
+          status: search.status, reason: search.reason, httpStatus: search.httpStatus, durationMs: now() - searchStartedAt
+        });
         const answer = await askOllama(fetcher, config, text, history, search, {
-          signal: controller.signal, timeoutMs: remainingMs() - 300
+          signal: controller.signal, timeoutMs: remainingMs() - 100
         });
         completed = { ...job, status: 'done', answer, history: safeHistory([...history, { role: 'user', text }, { role: 'assistant', text: answer }]) };
       } catch (error) {
-        completed = { ...job, status: 'failed', answer: errorForUser(error), history };
+        const excerpt = error?.message === 'OLLAMA_TIMEOUT' ? searchExcerpt(search) : '';
+        completed = excerpt
+          ? { ...job, status: 'done', answer: excerpt, history: safeHistory([...history, { role: 'user', text }, { role: 'assistant', text: excerpt }]) }
+          : { ...job, status: 'failed', answer: errorForUser(error), history };
       }
       // Finish before returning; no background generation or polling command.
       if (!controller.signal.aborted) {

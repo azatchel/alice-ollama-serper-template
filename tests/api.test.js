@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHandler, fitAliceText, safeHistory, isSearchIntent } from '../api/index.js';
-import { searchWeb, askOllama, configuration, fetchJson, keysFor, TOTAL_RESPONSE_BUDGET_MS, SERPER_TIMEOUT_MS } from '../lib/core.js';
+import { searchWeb, searchExcerpt, SYSTEM_PROMPT, askOllama, configuration, fetchJson, keysFor, TOTAL_RESPONSE_BUDGET_MS, SERPER_TIMEOUT_MS } from '../lib/core.js';
 import { createStore, createMemoryStore } from '../lib/store.js';
 
 const env = { WEBHOOK_SECRET: 'a'.repeat(40), ALICE_SKILL_ID: 'skill', OLLAMA_API_KEY: 'ollama-test',
@@ -19,15 +19,13 @@ async function invoke(handler, req) {
   return result;
 }
 function harness(fetcher, overrides = {}) {
-  let time=100000, nextAllowed=0, reservations=0;
+  let time=100000, reservations=0;
   const records=new Map();
   const store={
     async reserve(keys, job) {
       reservations++;
       const previous=records.get(keys.job);
       if (previous?.messageId >= job.messageId) return {code:-1, job:previous};
-      if (time < nextAllowed) return {code:nextAllowed-time};
-      nextAllowed=time+15000;
       const saved={...job,history:previous?.history || []};
       records.set(keys.job,saved);
       return {code:0,job:saved};
@@ -91,15 +89,13 @@ test('returns model answer in the original HTTP response with search context and
   assert.doesNotMatch(result.body.response.text,/hidden|Вопрос принят|скажи/);
 });
 
-test('global 15-second limit across sessions; rejected attempts do not extend cooldown',async()=>{
+test('successive questions and different sessions have no cooldown',async()=>{
   let calls=0;
   const h=harness(async()=>{calls++;return answer();});
-  const results=await Promise.all([invoke(h.handler,request('Первый',1,'a')),invoke(h.handler,request('Второй',1,'b'))]);
-  assert.equal(results.filter(x=>x.body.response.text==='Прямой ответ.').length,1);assert.equal(calls,1);
-  h.advance(14999);
-  assert.match((await invoke(h.handler,request('Второй',2,'b'))).body.response.text,/через 1 секунд/);
-  h.advance(1);
-  assert.equal((await invoke(h.handler,request('Второй',3,'b'))).body.response.text,'Прямой ответ.');assert.equal(calls,2);
+  for (const req of [request('Первый',1,'a'),request('Второй',2,'a'),request('Третий',1,'b')]) {
+    assert.equal((await invoke(h.handler,req)).body.response.text,'Прямой ответ.');
+  }
+  assert.equal(calls,3);
 });
 
 test('duplicate delivery reuses result; history continues; “ответ” is an ordinary utterance',async()=>{
@@ -125,7 +121,7 @@ test('local storage failure blocks inference; failed result save still returns t
 });
 
 test('search failure is explicit and provider failures/thinking do not leak',async()=>{
-  assert.deepEqual(await searchWeb(async()=>json({error:'secret'},429),config,'погода'),{status:'unavailable'});
+  assert.deepEqual(await searchWeb(async()=>json({error:'secret'},429),config,'погода'),{status:'unavailable',reason:'http_error',httpStatus:429});
   for(const [status,message] of [[401,'ключа'],[429,'Лимит'],[404,'недоступна'],[500,'Не удалось']]){
     const h=harness(async()=>json({error:'secret-credential'},status));
     const result=(await invoke(h.handler,request())).body.response.text;
@@ -151,7 +147,7 @@ test('network timeout and parent abort cancel calls; response size/JSON are boun
   await assert.rejects(fetchJson(async()=>new Response('not JSON'),'https://example.com',{},100),/INVALID_RESPONSE/);
 });
 
-test('Serper cancellation at 600ms leaves time for Ollama',async t=>{
+test('Serper cancellation at 1800ms leaves time for Ollama',async t=>{
   t.mock.timers.enable({apis:['setTimeout']});
   let signal;
   const work=searchWeb(async(url,opts)=>{
@@ -159,7 +155,7 @@ test('Serper cancellation at 600ms leaves time for Ollama',async t=>{
     return new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(new DOMException('aborted','AbortError'))));
   },config,'новости');
   t.mock.timers.tick(SERPER_TIMEOUT_MS-1);assert.equal(signal.aborted,false);
-  t.mock.timers.tick(1);assert.deepEqual(await work,{status:'unavailable'});
+  t.mock.timers.tick(1);assert.deepEqual(await work,{status:'unavailable',reason:'timeout'});
 });
 
 test('hard 3600ms deadline returns exactly once and aborts a stalled Ollama call',async t=>{
@@ -179,7 +175,7 @@ test('hard 3600ms deadline returns exactly once and aborts a stalled Ollama call
   assert.doesNotMatch(result.body.response.text,/скажи|Вопрос принят/);
 });
 
-test('deadline also covers a stalled rate-limit store and never starts inference',async t=>{
+test('deadline also covers a stalled local store and never starts inference',async t=>{
   t.mock.timers.enable({apis:['setTimeout']});
   let calls=0;
   const h=harness(()=>{calls++;return answer();},{reserve:()=>new Promise(()=>{})});
@@ -188,13 +184,13 @@ test('deadline also covers a stalled rate-limit store and never starts inference
   assert.match((await work).body.response.text,/Не успела/);assert.equal(calls,0);
 });
 
-test('local store shares a cooldown, expires records, deduplicates and rejects stale completion',()=>{
+test('local store has no cooldown, expires records, deduplicates and rejects stale completion',()=>{
   let time=100000;
   const store=createMemoryStore({now:()=>time});
   const keys={rate:'rate',job:'job'};
   const first={id:'first',messageId:1};
   assert.equal(store.reserve(keys,first).code,0);
-  assert.equal(store.reserve({rate:'rate',job:'other'},{id:'other',messageId:1}).code,15000);
+  assert.equal(store.reserve({job:'other'},{id:'other',messageId:1}).code,0);
   store.complete('job',{...first,answer:'cached',history:[{role:'user',text:'hi'}]});
   assert.equal(store.reserve(keys,first).job.answer,'cached');
   time+=15000;
@@ -221,7 +217,7 @@ test('local store bounds memory and a separate instance has independent limits',
 test('session keys bind application and session without exposing raw identifiers',()=>{
   const a=keysFor(config,request().body.session);
   const b=keysFor(config,{...request().body.session,session_id:'other'});
-  assert.equal(a.rate,b.rate);assert.notEqual(a.job,b.job);assert.doesNotMatch(a.job,/session|skill|app/);
+  assert.notEqual(a.job,b.job);assert.doesNotMatch(a.job,/session|skill|app/);
 });
 
 test('configuration diagnostic names invalid variables without leaking secrets or URL parser errors', async()=>{
@@ -260,4 +256,31 @@ test('alternate models keep their own thinking default instead of inheriting Gem
   assert.equal(payload.model,'gpt-oss:20b');
   assert.equal(Object.hasOwn(payload,'think'),false);
   assert.equal(payload.options.num_predict,2048);
+});
+
+
+test('prompt allows general conversation and distinguishes unused search from failure',()=>{
+  assert.match(SYSTEM_PROMPT,/на любые темы/);
+  assert.match(SYSTEM_PROMPT,/not_requested/);
+  assert.match(SYSTEM_PROMPT,/не жалуйся на поиск/);
+  assert.match(SYSTEM_PROMPT,/не говори, что поиск недоступен/);
+});
+
+test('Serper reports missing key and HTTP errors without leaking response details',async()=>{
+  assert.deepEqual(await searchWeb(()=>{throw Error();},{...config,serperKey:''},'query'),{status:'unavailable',reason:'missing_key'});
+  assert.deepEqual(await searchWeb(async()=>json({error:'private-api-key'},403),config,'query'),{status:'unavailable',reason:'http_error',httpStatus:403});
+  assert.equal(searchExcerpt({status:'available',answer:'Найденный факт',organic:[]}),'В поисковой выдаче: Найденный факт');
+  assert.equal(searchExcerpt({status:'unavailable'}),'');
+});
+
+test('completed Serper results remain usable when Ollama times out, with private-safe logs',async()=>{
+  const logs=[];
+  const handler=createHandler({env,storeFactory:()=>createMemoryStore(),logger:{info:(...args)=>logs.push(args)},fetcher:async(url)=>{
+    if(url.includes('serper'))return json({organic:[{title:'Источник',snippet:'Сегодня ясно.',link:'https://example.com'}]});
+    throw new DOMException('provider-secret','AbortError');
+  }});
+  const result=await invoke(handler,request('Какая погода сегодня?'));
+  assert.equal(result.body.response.text,'В поисковой выдаче: Сегодня ясно.');
+  assert.equal(logs[0][1].status,'available');
+  assert.doesNotMatch(JSON.stringify(logs),/provider-secret|Сегодня ясно|ollama-test|serper-test|Какая погода/);
 });
