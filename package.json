@@ -1,13 +1,16 @@
 {
-  "name": "alice-gemini-serper-template",
+  "name": "alice-ollama-serper",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Minimal Vercel webhook for a Yandex Alice skill powered by Gemini with optional Serper web search",
+  "description": "Yandex Alice skill with Ollama Cloud, Serper search, authenticated webhook and shared rate limiting",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "test": "node --test"
+  },
+  "dependencies": {
+    "@vercel/functions": "3.6.1"
   }
 }
