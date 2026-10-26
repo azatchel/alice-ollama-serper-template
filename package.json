@@ -9,8 +9,5 @@
   },
   "scripts": {
     "test": "node --test"
-  },
-  "dependencies": {
-    "@vercel/functions": "3.6.1"
   }
 }

@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { waitUntil } from '@vercel/functions';
 import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, configuration, authorized,
-  keysFor, searchWeb, askOllama, errorForUser } from '../lib/core.js';
+  keysFor, searchWeb, askOllama, errorForUser, TOTAL_RESPONSE_BUDGET_MS } from '../lib/core.js';
 import { createStore } from '../lib/store.js';
 
-const POLL = /^(ответ|готово|готов|результат|проверить|повтори)[.!?\s]*$/i;
 const ID = value => typeof value === 'string' && value.length > 0 && value.length <= 256;
 
-export function createHandler({ env = process.env, fetcher = fetch, defer = waitUntil, storeFactory = createStore, now = Date.now } = {}) {
+export function createHandler({ env = process.env, fetcher = fetch, storeFactory = createStore, now = Date.now } = {}) {
   return async function handler(req, res) {
+    const startedAt = now();
+    const remainingMs = () => Math.max(0, TOTAL_RESPONSE_BUDGET_MS - (now() - startedAt));
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     if (req.method === 'GET') return res.status(200).json({ ok: true, service: 'alice-ollama-serper' });
@@ -33,43 +33,55 @@ export function createHandler({ env = process.env, fetcher = fetch, defer = wait
     if (typeof raw !== 'string' || raw.length > 1200) return res.status(400).json({ error: 'Invalid utterance' });
     const text = raw.trim();
     const reply = value => res.status(200).json(aliceResponse(value));
-    if (!text) return reply('Привет! Задай вопрос. Я подготовлю ответ, затем скажи «ответ», чтобы его услышать.');
+    if (!text) return reply('Привет! Задай вопрос — я постараюсь сразу ответить.');
     const keys = keysFor(config, session);
-    const store = storeFactory(config, fetcher);
-    try {
-      const previous = await store.get(keys.job);
-      if (POLL.test(text) || (previous && previous.messageId >= session.message_id)) {
-        if (!previous) return reply('Готового ответа пока нет или он уже устарел. Задай вопрос заново.');
-        if (previous.status === 'pending') return reply(now() - previous.startedAt > 50000
-          ? 'Обработка прервалась. Подожди три минуты и задай вопрос заново.'
-          : 'Ответ ещё готовится. Через несколько секунд скажи «ответ».');
-        return reply(previous.answer);
+    const controller = new AbortController();
+    const store = storeFactory(config, fetcher, { signal: controller.signal });
+    const timeoutReply = 'Не успела подготовить ответ. Попробуй задать вопрос чуть короче через 15 секунд.';
+    let deadlineTimer;
+    const deadline = new Promise(resolve => {
+      deadlineTimer = setTimeout(() => {
+        controller.abort();
+        resolve(timeoutReply);
+      }, remainingMs());
+    });
+    async function respond() {
+      let job;
+      try {
+        // Load history, deduplicate and reserve the global slot in ONE Redis round trip.
+        const reservation = await store.reserve(keys, {
+          id: randomUUID(), messageId: session.message_id, status: 'pending', startedAt: now()
+        });
+        if (reservation.code === -1) return reservation.job?.answer || 'Этот вопрос уже обрабатывается. Попробуй позже.';
+        if (reservation.code > 0) return `Новый вопрос можно задать через ${Math.ceil(reservation.code / 1000)} секунд.`;
+        job = reservation.job;
+      } catch {
+        // Fail closed: unavailable storage cannot bypass rate limiting.
+        return 'Сервис временно недоступен. Попробуй позже.';
       }
-      if (previous?.status === 'pending') return reply('Предыдущий вопрос ещё обрабатывается. Скажи «ответ», чтобы проверить результат.');
-      const history = safeHistory(previous?.history);
-      const job = { id: randomUUID(), messageId: session.message_id, status: 'pending', startedAt: now(), history };
-      const reservation = await store.reserve(keys, job);
-      if (reservation === -1 || reservation === -2) return reply('Вопрос уже принят. Через несколько секунд скажи «ответ».');
-      if (reservation > 0) return reply(`Новый вопрос можно задать через ${Math.ceil(reservation / 1000)} секунд. Пока скажи «ответ», чтобы услышать предыдущий результат.`);
-      const work = (async () => {
-        let completed;
-        try {
-          const search = isSearchIntent(text) ? await searchWeb(fetcher, config, text) : { status: 'not_requested' };
-          const answer = await askOllama(fetcher, config, text, history, search);
-          completed = { ...job, status: 'done', answer, history: safeHistory([...history, { role: 'user', text }, { role: 'assistant', text: answer }]) };
-        } catch (error) {
-          completed = { ...job, status: 'failed', answer: errorForUser(error) };
-          console.warn('Background generation failed');
-        }
+      if (controller.signal.aborted) return timeoutReply;
+      const history = safeHistory(job.history);
+      let completed;
+      try {
+        const search = isSearchIntent(text)
+          ? await searchWeb(fetcher, config, text, { signal: controller.signal, timeoutMs: Math.min(600, Math.max(0, remainingMs() - 1000)) })
+          : { status: 'not_requested' };
+        const answer = await askOllama(fetcher, config, text, history, search, {
+          signal: controller.signal, timeoutMs: remainingMs() - 300
+        });
+        completed = { ...job, status: 'done', answer, history: safeHistory([...history, { role: 'user', text }, { role: 'assistant', text: answer }]) };
+      } catch (error) {
+        completed = { ...job, status: 'failed', answer: errorForUser(error), history };
+      }
+      // Finish before returning; no background generation or polling command.
+      if (!controller.signal.aborted) {
         try { await store.complete(keys.job, completed); }
-        catch { console.warn('Background result could not be saved'); }
-      })();
-      defer(work);
-      return reply('Вопрос принят. Через несколько секунд скажи «ответ», чтобы услышать результат.');
-    } catch {
-      // Fail closed: storage failure never bypasses rate limiting or starts inference.
-      return reply('Сервис временно недоступен. Попробуй позже.');
+        catch { console.warn('Result could not be saved'); }
+      }
+      return completed.answer;
     }
+    try { return reply(await Promise.race([respond(), deadline])); }
+    finally { clearTimeout(deadlineTimer); controller.abort(); }
   };
 }
 
