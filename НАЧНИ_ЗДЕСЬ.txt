@@ -1,4 +1,4 @@
-Ollama Cloud (kimi-k2.7-code) + необязательный Serper, без Redis.
+Ollama Cloud (gemma4:31b) + необязательный Serper, без Redis.
 
 Обязательны только OLLAMA_API_KEY и WEBHOOK_SECRET.
 WEBHOOK_SECRET — ваш случайный пароль минимум 32 символа. Сгенерируйте:

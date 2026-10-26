@@ -82,7 +82,9 @@ test('returns model answer in the original HTTP response with search context and
   assert.equal(result.body.session_state,undefined);
   assert.equal(calls.length,2);
   assert.equal(calls[1].url,'https://ollama.com/api/chat');
-  assert.equal(calls[1].body.model,'kimi-k2.7-code');
+  assert.equal(calls[1].body.model,'gemma4:31b');
+  assert.equal(calls[1].body.think,false);
+  assert.equal(calls[1].body.options.num_predict,150);
   assert.equal(calls[1].body.stream,false);
   assert.equal(calls[1].headers.Authorization,'Bearer ollama-test');
   assert.equal(JSON.parse(calls[1].body.messages.at(-1).content).web_search.status,'available');
@@ -248,4 +250,14 @@ test('skill ID is optional while configured skill ID and webhook secret remain e
   const strict=createHandler({env,fetcher:answer});
   const wrong=request();wrong.body.session.skill_id='other';
   assert.equal((await invoke(strict,wrong)).status,400);
+});
+
+
+test('alternate models keep their own thinking default instead of inheriting Gemma controls',async()=>{
+  let payload;
+  await askOllama(async(url,opts)=>{payload=JSON.parse(opts.body);return answer();},
+    {...config,model:'gpt-oss:20b'},'hi',[],{status:'not_requested'});
+  assert.equal(payload.model,'gpt-oss:20b');
+  assert.equal(Object.hasOwn(payload,'think'),false);
+  assert.equal(payload.options.num_predict,2048);
 });
