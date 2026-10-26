@@ -5,7 +5,7 @@ import { createStore } from '../lib/store.js';
 
 const ID = value => typeof value === 'string' && value.length > 0 && value.length <= 256;
 
-export function createHandler({ env = process.env, fetcher = fetch, storeFactory = createStore, now = Date.now } = {}) {
+export function createHandler({ env = process.env, fetcher = fetch, storeFactory = createStore, now = Date.now, logger = console } = {}) {
   return async function handler(req, res) {
     const startedAt = now();
     const remainingMs = () => Math.max(0, TOTAL_RESPONSE_BUDGET_MS - (now() - startedAt));
@@ -17,7 +17,10 @@ export function createHandler({ env = process.env, fetcher = fetch, storeFactory
       return res.status(405).json({ error: 'Method not allowed' });
     }
     let config;
-    try { config = configuration(env); } catch { return res.status(503).json({ error: 'Service not configured' }); }
+    try { config = configuration(env); } catch (error) {
+      logger.error('Webhook configuration invalid. Check Environment Variables and redeploy.', { fields: error.fields || [] });
+      return res.status(503).json({ error: 'Service not configured' });
+    }
     try {
       if (!authorized(req, config.secret)) return res.status(403).json({ error: 'Forbidden' });
     } catch { return res.status(403).json({ error: 'Forbidden' }); }

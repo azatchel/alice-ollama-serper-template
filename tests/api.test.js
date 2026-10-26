@@ -208,3 +208,18 @@ test('session keys bind application and session without exposing raw identifiers
   const b=keysFor(config,{...request().body.session,session_id:'other'});
   assert.equal(a.rate,b.rate);assert.notEqual(a.job,b.job);assert.doesNotMatch(a.job,/session|skill|app/);
 });
+
+test('configuration diagnostic names invalid variables without leaking secrets or URL parser errors', async()=>{
+  const logs=[];
+  const broken={...env,WEBHOOK_SECRET:'short-secret',UPSTASH_REDIS_REST_URL:'not-a-url-with-secret',UPSTASH_REDIS_REST_TOKEN:''};
+  const handler=createHandler({env:broken,logger:{error:(...args)=>logs.push(args)},fetcher:()=>{throw Error('must not call');}});
+  const result=await invoke(handler,request());
+  assert.equal(result.status,503);
+  assert.deepEqual(result.body,{error:'Service not configured'});
+  assert.deepEqual(logs[0][1].fields,['UPSTASH_REDIS_REST_TOKEN','WEBHOOK_SECRET','UPSTASH_REDIS_REST_URL']);
+  assert.doesNotMatch(JSON.stringify(logs),/short-secret|not-a-url-with-secret|ollama-test/);
+  assert.throws(()=>configuration({}),error=>{
+    assert.deepEqual(error.fields,['WEBHOOK_SECRET','ALICE_SKILL_ID','OLLAMA_API_KEY','UPSTASH_REDIS_REST_TOKEN','UPSTASH_REDIS_REST_URL']);
+    return true;
+  });
+});
