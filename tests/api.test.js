@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHandler, fitAliceText, safeHistory, isSearchIntent } from '../api/index.js';
 import { searchWeb, askOllama, configuration, fetchJson, keysFor, TOTAL_RESPONSE_BUDGET_MS, SERPER_TIMEOUT_MS } from '../lib/core.js';
-import { createStore, RESERVE_SCRIPT, COMPLETE_SCRIPT } from '../lib/store.js';
+import { createStore, createMemoryStore } from '../lib/store.js';
 
 const env = { WEBHOOK_SECRET: 'a'.repeat(40), ALICE_SKILL_ID: 'skill', OLLAMA_API_KEY: 'ollama-test',
-  SERPER_API_KEY: 'serper-test', UPSTASH_REDIS_REST_URL: 'https://test.upstash.io', UPSTASH_REDIS_REST_TOKEN: 'redis-test' };
+  SERPER_API_KEY: 'serper-test' };
 const config = configuration(env);
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
 function request(text = 'Привет', messageId = 1, sessionId = 'session') {
@@ -55,7 +55,6 @@ test('health/methods/configuration and unauthorized input fail safely',async()=>
   assert.equal((await invoke(handler,{method:'GET'})).body.service,'alice-ollama-serper');
   assert.equal((await invoke(handler,{method:'DELETE'})).status,405);
   assert.equal((await invoke(handler,request())).status,503);
-  assert.throws(()=>configuration({...env,UPSTASH_REDIS_REST_URL:'https://attacker.example'}));
   assert.throws(()=>configuration({...env,WEBHOOK_SECRET:'short'}));
   const h=harness(()=>{throw Error('unexpected API');});
   const badSecret=request();badSecret.url='/api?token=wrong';
@@ -116,7 +115,7 @@ test('duplicate delivery reuses result; history continues; “ответ” is a
   await invoke(h.handler,request('Первый',1));assert.equal(bodies.length,2);
 });
 
-test('storage outage blocks inference; failed result save still returns the answer',async()=>{
+test('local storage failure blocks inference; failed result save still returns the answer',async()=>{
   const h=harness(()=>{throw Error('must not call');},{reserve:async()=>{throw Error();}});
   assert.match((await invoke(h.handler,request())).body.response.text,/недоступен/);
   const saving=harness(answer,{complete:async()=>{throw Error();}});
@@ -178,7 +177,7 @@ test('hard 3600ms deadline returns exactly once and aborts a stalled Ollama call
   assert.doesNotMatch(result.body.response.text,/скажи|Вопрос принят/);
 });
 
-test('deadline also covers a stalled rate-limit backend and never starts inference',async t=>{
+test('deadline also covers a stalled rate-limit store and never starts inference',async t=>{
   t.mock.timers.enable({apis:['setTimeout']});
   let calls=0;
   const h=harness(()=>{calls++;return answer();},{reserve:()=>new Promise(()=>{})});
@@ -187,20 +186,34 @@ test('deadline also covers a stalled rate-limit backend and never starts inferen
   assert.match((await work).body.response.text,/Не успела/);assert.equal(calls,0);
 });
 
-test('atomic Redis contract loads history and limits in one call, completion uses CAS',async()=>{
-  const calls=[];const job={id:'test',messageId:1,history:[]};
-  const store=createStore(config,async(url,opts)=>{
-    calls.push(JSON.parse(opts.body));
-    return json({result:calls.length===1?[0,JSON.stringify(job)]:1});
-  });
-  assert.deepEqual(await store.reserve({rate:'rate',job:'job'},job),{code:0,job});
-  await store.complete('job',job);
-  assert.deepEqual(calls[0],['EVAL',RESERVE_SCRIPT,2,'rate','job',1,JSON.stringify(job),15,180]);
-  assert.deepEqual(calls[1],['EVAL',COMPLETE_SCRIPT,1,'job','test',JSON.stringify(job),180]);
-  const broken=createStore(config,async()=>json({error:'failure'}));
-  await assert.rejects(broken.reserve({rate:'rate',job:'job'},job),/STORE_UNAVAILABLE/);
-  const malformed=createStore(config,async()=>json({result:0}));
-  await assert.rejects(malformed.reserve({rate:'rate',job:'job'},job),/STORE_UNAVAILABLE/);
+test('local store shares a cooldown, expires records, deduplicates and rejects stale completion',()=>{
+  let time=100000;
+  const store=createMemoryStore({now:()=>time});
+  const keys={rate:'rate',job:'job'};
+  const first={id:'first',messageId:1};
+  assert.equal(store.reserve(keys,first).code,0);
+  assert.equal(store.reserve({rate:'rate',job:'other'},{id:'other',messageId:1}).code,15000);
+  store.complete('job',{...first,answer:'cached',history:[{role:'user',text:'hi'}]});
+  assert.equal(store.reserve(keys,first).job.answer,'cached');
+  time+=15000;
+  const second={id:'second',messageId:2};
+  assert.equal(store.reserve(keys,second).job.history[0].text,'hi');
+  store.complete('job',{...first,answer:'stale'});
+  assert.equal(store.reserve(keys,second).job.id,'second');
+  time+=180000;
+  assert.equal(store.reserve(keys,first).code,0);
+  assert.equal(createStore(),createStore());
+});
+
+test('local store bounds memory and a separate instance has independent limits',()=>{
+  let time=100000;
+  const store=createMemoryStore({now:()=>time,maxEntries:1});
+  store.reserve({rate:'a',job:'a'},{id:'a',messageId:1});
+  time+=15000;
+  assert.throws(()=>store.reserve({rate:'a',job:'b'},{id:'b',messageId:1}),/LOCAL_STORE_FULL/);
+  assert.equal(createMemoryStore({now:()=>time}).reserve({rate:'a',job:'a'},{id:'a',messageId:1}).code,0);
+  time+=180000;
+  assert.equal(store.reserve({rate:'a',job:'b'},{id:'b',messageId:1}).code,0);
 });
 
 test('session keys bind application and session without exposing raw identifiers',()=>{
@@ -211,15 +224,28 @@ test('session keys bind application and session without exposing raw identifiers
 
 test('configuration diagnostic names invalid variables without leaking secrets or URL parser errors', async()=>{
   const logs=[];
-  const broken={...env,WEBHOOK_SECRET:'short-secret',UPSTASH_REDIS_REST_URL:'not-a-url-with-secret',UPSTASH_REDIS_REST_TOKEN:''};
+  const broken={...env,WEBHOOK_SECRET:'short-secret',OLLAMA_MODEL:'invalid model secret'};
   const handler=createHandler({env:broken,logger:{error:(...args)=>logs.push(args)},fetcher:()=>{throw Error('must not call');}});
   const result=await invoke(handler,request());
   assert.equal(result.status,503);
   assert.deepEqual(result.body,{error:'Service not configured'});
-  assert.deepEqual(logs[0][1].fields,['UPSTASH_REDIS_REST_TOKEN','WEBHOOK_SECRET','UPSTASH_REDIS_REST_URL']);
-  assert.doesNotMatch(JSON.stringify(logs),/short-secret|not-a-url-with-secret|ollama-test/);
+  assert.deepEqual(logs[0][1].fields,['WEBHOOK_SECRET','OLLAMA_MODEL']);
+  assert.doesNotMatch(JSON.stringify(logs),/short-secret|invalid model secret|ollama-test/);
   assert.throws(()=>configuration({}),error=>{
-    assert.deepEqual(error.fields,['WEBHOOK_SECRET','ALICE_SKILL_ID','OLLAMA_API_KEY','UPSTASH_REDIS_REST_TOKEN','UPSTASH_REDIS_REST_URL']);
+    assert.deepEqual(error.fields,['WEBHOOK_SECRET','OLLAMA_API_KEY']);
     return true;
   });
+});
+
+
+test('skill ID is optional while configured skill ID and webhook secret remain enforced',async()=>{
+  const minimal={OLLAMA_API_KEY:'test',WEBHOOK_SECRET:env.WEBHOOK_SECRET};
+  assert.equal(configuration(minimal).skill,undefined);
+  const handler=createHandler({env:minimal,fetcher:answer,storeFactory:()=>createMemoryStore()});
+  assert.equal((await invoke(handler,request('hi',1,'no-redis'))).body.response.text,'Прямой ответ.');
+  const invalid=request();invalid.url='/api';
+  assert.equal((await invoke(handler,invalid)).status,403);
+  const strict=createHandler({env,fetcher:answer});
+  const wrong=request();wrong.body.session.skill_id='other';
+  assert.equal((await invoke(strict,wrong)).status,400);
 });

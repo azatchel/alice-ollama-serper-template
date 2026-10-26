@@ -29,7 +29,7 @@ export function createHandler({ env = process.env, fetcher = fetch, storeFactory
     if (!body || typeof body !== 'object' || Array.isArray(body)) return res.status(400).json({ error: 'Invalid request' });
     if (Buffer.byteLength(JSON.stringify(body)) > 32768) return res.status(413).json({ error: 'Request too large' });
     const session = body.session;
-    if (body.version !== '1.0' || session?.skill_id !== config.skill || !ID(session?.session_id) ||
+    if (body.version !== '1.0' || !ID(session?.skill_id) || (config.skill && session.skill_id !== config.skill) || !ID(session?.session_id) ||
         !ID(session?.application?.application_id) || !Number.isSafeInteger(session?.message_id) || session.message_id < 0 ||
         body.request?.type !== 'SimpleUtterance') return res.status(400).json({ error: 'Invalid Alice request' });
     const raw = body.request.command ?? body.request.original_utterance;
@@ -51,7 +51,7 @@ export function createHandler({ env = process.env, fetcher = fetch, storeFactory
     async function respond() {
       let job;
       try {
-        // Load history, deduplicate and reserve the global slot in ONE Redis round trip.
+        // Reserve synchronously in process memory before starting any external call.
         const reservation = await store.reserve(keys, {
           id: randomUUID(), messageId: session.message_id, status: 'pending', startedAt: now()
         });
@@ -59,7 +59,7 @@ export function createHandler({ env = process.env, fetcher = fetch, storeFactory
         if (reservation.code > 0) return `Новый вопрос можно задать через ${Math.ceil(reservation.code / 1000)} секунд.`;
         job = reservation.job;
       } catch {
-        // Fail closed: unavailable storage cannot bypass rate limiting.
+        // Fail closed if the bounded local store cannot accept a record.
         return 'Сервис временно недоступен. Попробуй позже.';
       }
       if (controller.signal.aborted) return timeoutReply;
